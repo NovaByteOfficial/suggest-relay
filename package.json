@@ -1,0 +1,16 @@
+{
+  "name": "suggest-relay",
+  "version": "1.0.0",
+  "description": "Open source search suggestion relay for NovaByte. Masks user IPs from upstream search engines.",
+  "main": "relay.js",
+  "scripts": {
+    "start": "node relay.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  },
+  "license": "Apache-2.0"
+}
