@@ -10,6 +10,7 @@
 // What this does NOT do: log queries, log IPs, store anything.
 
 const express = require('express');
+const crypto  = require('crypto');
 const app     = express();
 
 const PORT = process.env.PORT || 3010;
@@ -21,7 +22,6 @@ const PORT = process.env.PORT || 3010;
 // ── HTTPS enforcement ─────────────────────────────────────────────────────
 // Render terminates TLS and sets x-forwarded-proto.
 // Any plain HTTP request is redirected to HTTPS immediately.
-// This means Render only ever sees encrypted traffic — not query contents.
 app.use((req, res, next) => {
     if (
         process.env.NODE_ENV === 'production' &&
@@ -41,24 +41,57 @@ app.use((req, res, next) => {
     next();
 });
 
-// ── Shared: clean outbound headers ───────────────────────────────────────
-// No user-identifying info forwarded upstream on any request.
-const CLEAN_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (compatible; NovaByte/1.0)',
-    'Accept':     'application/json, */*;q=0.8',
-};
+// ── Rotating User-Agent pool ──────────────────────────────────────────────
+// Cycles through realistic browser UA strings so upstream services (Google,
+// DDG, etc.) cannot fingerprint all relay traffic as a single NovaByte bot.
+// Each request picks the next UA in the pool round-robin.
+const UA_POOL = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0',
+];
+let _uaIndex = 0;
+function nextUA() {
+    const ua = UA_POOL[_uaIndex % UA_POOL.length];
+    _uaIndex++;
+    return ua;
+}
+
+// ── Rotating HMAC salt for IP hashing ────────────────────────────────────
+// IPs are never stored in plaintext. Instead they are hashed with a secret
+// salt that rotates every hour. This means:
+//   - The debounce Map never contains a real IP address
+//   - Even if the process memory were dumped, IPs could not be recovered
+//   - Hashes cannot be correlated across hour boundaries
+let _salt     = crypto.randomBytes(32);
+let _saltTime = Math.floor(Date.now() / 3_600_000); // current hour bucket
+
+function hashIp(ip) {
+    const hourBucket = Math.floor(Date.now() / 3_600_000);
+    if (hourBucket !== _saltTime) {
+        // New hour — rotate salt so old hashes are permanently unlinkable
+        _salt     = crypto.randomBytes(32);
+        _saltTime = hourBucket;
+    }
+    return crypto.createHmac('sha256', _salt).update(ip).digest('hex');
+}
 
 // ── Shared: per-IP debounce abuse protection ──────────────────────────────
 // Drops duplicate requests from the same IP within 100ms.
-// Not a hard rate limit — normal typing speed is never affected.
+// Keyed on hashed IP — real addresses never touch this Map.
 const lastSeen = new Map();
 const DEBOUNCE = 100; // ms
 
 function debounced(ip) {
+    const key  = hashIp(ip);
     const now  = Date.now();
-    const last = lastSeen.get(ip) || 0;
+    const last = lastSeen.get(key) || 0;
     if (now - last < DEBOUNCE) return true;
-    lastSeen.set(ip, now);
+    lastSeen.set(key, now);
     // Prevent unbounded growth — evict entries older than 10s
     if (lastSeen.size > 10000) {
         for (const [k, v] of lastSeen) {
@@ -66,6 +99,14 @@ function debounced(ip) {
         }
     }
     return false;
+}
+
+// ── Shared: random jitter ─────────────────────────────────────────────────
+// Adds 5–50ms of random delay before every upstream request.
+// Breaks naive timing correlation between when the client sends a request
+// and when the upstream service receives it.
+function jitter() {
+    return new Promise(resolve => setTimeout(resolve, 5 + Math.random() * 45));
 }
 
 // ── Shared: fetch with timeout ────────────────────────────────────────────
@@ -100,15 +141,21 @@ app.get('/suggest', async (req, res) => {
     if (!ENGINES[engine])       return res.status(400).json({ suggestions: [] });
 
     try {
+        await jitter();
+
         const upstream = await fetchWithTimeout(ENGINES[engine](q), {
-            headers: CLEAN_HEADERS,
+            headers: {
+                'User-Agent': nextUA(),
+                'Accept':     'application/json, */*;q=0.8',
+            },
         }, 4000);
 
         if (!upstream.ok) return res.status(502).json({ suggestions: [] });
 
         const json = await upstream.json();
         res.setHeader('Cache-Control', 'private, max-age=60');
-        res.json(json); // pass raw response — NBOSP server parses it
+        // X-Suggest-Via intentionally omitted — do not leak relay status to client
+        res.json(json);
     } catch {
         res.status(502).json({ suggestions: [] });
     }
@@ -132,10 +179,12 @@ app.get('/favicon', async (req, res) => {
     const safeSize = Math.min(Math.max(size, 16), 128);
 
     try {
+        await jitter();
+
         const url = `https://www.google.com/s2/favicons?domain=${encodeURIComponent(domain)}&sz=${safeSize}`;
         const upstream = await fetchWithTimeout(url, {
             headers: {
-                'User-Agent': 'Mozilla/5.0 (compatible; NovaByte/1.0)',
+                'User-Agent': nextUA(),
                 'Accept':     'image/png,image/x-icon,image/*,*/*;q=0.8',
             },
         }, 5000);
@@ -175,9 +224,11 @@ app.get('/email-image', async (req, res) => {
     if (!['http:', 'https:'].includes(parsed.protocol)) return res.status(400).send();
 
     try {
+        await jitter();
+
         const upstream = await fetchWithTimeout(url, {
             headers: {
-                'User-Agent': 'Mozilla/5.0 (compatible; NovaByte/1.0)',
+                'User-Agent': nextUA(),
                 'Accept':     'image/png,image/webp,image/jpeg,image/gif,image/*,*/*;q=0.8',
             },
             redirect: 'follow',
